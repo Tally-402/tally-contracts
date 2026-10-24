@@ -1,0 +1,7 @@
+out/
+cache/
+lib/
+broadcast/
+.env
+.solidity-auditor/
+.audit-*/
