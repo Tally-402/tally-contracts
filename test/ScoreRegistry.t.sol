@@ -140,18 +140,66 @@ contract ScoreRegistryTest is Test {
         assertEq(score, 640);
     }
 
-    function test_AfterRevoke_OlderValidScoreCanBeRecorded() public {
-        (bytes32[] memory p1,) = _publishTwo(1, _leaf(alice, 812), _leaf(bob, 300));
+    /// IMD swarm audit 2026-10-24, finding 2: after a revoke, an older epoch must not roll a subject back.
+    function test_AfterRevoke_OlderEpochCannotRollBack() public {
+        (bytes32[] memory p1,) = _publishTwo(1, _leaf(alice, 950), _leaf(bob, 300));
         vm.warp(block.timestamp + 1 days);
-        (bytes32[] memory p2,) = _publishTwo(2, _leaf(alice, 100), _leaf(bob, 300));
-        reg.record(2, _leaf(alice, 100), p2);
+        (bytes32[] memory p2,) = _publishTwo(2, _leaf(alice, 400), _leaf(bob, 300));
+        vm.warp(block.timestamp + 1 days);
+        (bytes32[] memory p3,) = _publishTwo(3, _leaf(alice, 350), _leaf(bob, 300));
+        reg.record(2, _leaf(alice, 400), p2);
+        reg.record(3, _leaf(alice, 350), p3);
         vm.prank(admin);
-        reg.revoke(2);
-        reg.record(1, _leaf(alice, 812), p1);
-        (bool found, uint16 score,, uint64 epoch,) = reg.scoreOf(alice);
-        assertTrue(found);
-        assertEq(score, 812);
-        assertEq(epoch, 1);
+        reg.revoke(3);
+        vm.expectRevert(abi.encodeWithSelector(ScoreRegistry.StaleRecord.selector, 1, 3));
+        reg.record(1, _leaf(alice, 950), p1);
+        vm.expectRevert(abi.encodeWithSelector(ScoreRegistry.StaleRecord.selector, 2, 3));
+        reg.record(2, _leaf(alice, 400), p2);
+        (bool found,,,,) = reg.scoreOf(alice);
+        assertFalse(found, "revoked record reads as missing");
+    }
+
+    /// IMD swarm audit 2026-10-24, finding 1: a revoked latest epoch can be replaced the same day.
+    function test_CorrectedSnapshotReplacesRevokedToday() public {
+        uint64 today = uint64(block.timestamp / 1 days);
+        (bytes32[] memory bad,) = _publishTwo(today, _leaf(alice, 999), _leaf(bob, 300));
+        reg.record(today, _leaf(alice, 999), bad);
+        vm.prank(admin);
+        reg.revoke(today);
+
+        (bytes32[] memory good,) = _publishTwo(today, _leaf(alice, 512), _leaf(bob, 300));
+        ScoreRegistry.Epoch memory e = reg.getEpoch(today);
+        assertFalse(e.revoked);
+        assertEq(e.generation, 2);
+        assertEq(reg.latestEpoch(), today);
+
+        // The record made under the bad root stays dead, and the bad proof no longer verifies.
+        (bool found,,,,) = reg.scoreOf(alice);
+        assertFalse(found, "record under revoked root stays dead");
+        assertFalse(reg.verify(today, _leaf(alice, 999), bad));
+
+        // The corrected score can be recorded for the same epoch.
+        reg.record(today, _leaf(alice, 512), good);
+        (bool f2, uint16 score,, uint64 ep,) = reg.scoreOf(alice);
+        assertTrue(f2);
+        assertEq(score, 512);
+        assertEq(ep, today);
+
+        // A live epoch still cannot be overwritten, and older days stay closed.
+        vm.prank(publisher);
+        vm.expectRevert(abi.encodeWithSelector(ScoreRegistry.EpochNotNewer.selector, today, today));
+        reg.publish(today, bytes32(uint256(7)), uint64(block.timestamp), 1, 1, "");
+    }
+
+    function test_RevertWhen_ReplacingOlderRevokedEpoch() public {
+        _publishTwo(1, _leaf(alice, 812), _leaf(bob, 300));
+        vm.warp(block.timestamp + 1 days);
+        _publishTwo(2, _leaf(alice, 640), _leaf(bob, 300));
+        vm.prank(admin);
+        reg.revoke(1);
+        vm.prank(publisher);
+        vm.expectRevert(abi.encodeWithSelector(ScoreRegistry.EpochNotNewer.selector, 1, 2));
+        reg.publish(1, bytes32(uint256(7)), uint64(block.timestamp), 1, 1, "");
     }
 
     function test_RevertWhen_EpochInFuture() public {

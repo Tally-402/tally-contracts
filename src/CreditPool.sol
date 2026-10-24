@@ -24,22 +24,28 @@ contract CreditPool is ERC4626, AccessControl {
     /// @notice Maximum share of total assets that may be lent out, in bps. Keeps a withdrawal buffer.
     uint16 public maxUtilizationBps = 9_000;
     uint16 public constant BPS = 10_000;
+    /// @notice Fee income unlocks into share value linearly over this period, so a deposit made just before
+    ///         a payment and redeemed just after earns nothing (IMD swarm audit 2026-10-24, finding 5).
+    uint256 public constant YIELD_UNLOCK = 1 days;
+    /// @notice Yield still locked as of `yieldUpdatedAt`.
+    uint256 public lockedYield;
+    uint256 public yieldUpdatedAt;
 
     event Funded(address indexed to, uint256 amount);
     event RepaymentRecorded(uint256 principal);
     event LossRealized(uint256 principal);
     event DepositCapSet(uint256 cap);
     event MaxUtilizationSet(uint16 bps);
+    event YieldAdded(uint256 amount, uint256 locked);
 
     error InsufficientIdle(uint256 requested, uint256 idle);
     error ExceedsOutstanding(uint256 amount, uint256 outstanding);
     error UtilizationCap(uint256 lentAfter, uint256 maxLent);
     error BadParams();
+    error ZeroAddress();
 
-    constructor(IERC20 usdc, address admin, uint256 cap)
-        ERC20("Tally Pool USDC", "tpUSDC")
-        ERC4626(usdc)
-    {
+    constructor(IERC20 usdc, address admin, uint256 cap) ERC20("Tally Pool USDC", "tpUSDC") ERC4626(usdc) {
+        if (admin == address(0) || address(usdc) == address(0)) revert ZeroAddress();
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         depositCap = cap;
         emit DepositCapSet(cap);
@@ -52,8 +58,18 @@ contract CreditPool is ERC4626, AccessControl {
         return IERC20(asset()).balanceOf(address(this));
     }
 
+    /// @notice Idle cash plus lent principal, minus fee income that has not unlocked yet.
     function totalAssets() public view override returns (uint256) {
-        return idle() + outstanding;
+        uint256 gross = idle() + outstanding;
+        uint256 locked = unvestedYield();
+        return gross > locked ? gross - locked : 0;
+    }
+
+    /// @notice Fee income received but not yet counted in share value.
+    function unvestedYield() public view returns (uint256) {
+        uint256 elapsed = block.timestamp - yieldUpdatedAt;
+        if (elapsed >= YIELD_UNLOCK) return 0;
+        return (lockedYield * (YIELD_UNLOCK - elapsed)) / YIELD_UNLOCK;
     }
 
     /// @dev Virtual share offset protects early depositors against donation/inflation attacks.
@@ -102,6 +118,14 @@ contract CreditPool is ERC4626, AccessControl {
         if (principal > outstanding) revert ExceedsOutstanding(principal, outstanding);
         outstanding -= principal;
         emit RepaymentRecorded(principal);
+    }
+
+    /// @notice Register fee income the caller has already transferred in. It unlocks over YIELD_UNLOCK;
+    ///         whatever is still locked from earlier fees restarts the same schedule.
+    function addYield(uint256 amount) external onlyRole(MANAGER_ROLE) {
+        lockedYield = unvestedYield() + amount;
+        yieldUpdatedAt = block.timestamp;
+        emit YieldAdded(amount, lockedYield);
     }
 
     /// @notice Write off principal that will not come back. Lowers share value.

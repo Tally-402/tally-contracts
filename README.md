@@ -38,10 +38,13 @@ Things to know: one agent's default reduces the shared collateral for every agen
 - Every line's balance stays at or below its collateral (max LTV is capped at 100% in v0).
 - TabManager holds exactly the posted collateral (lines and sponsors) plus treasury fees; Escrow holds exactly the open holds.
 - Depositors never lose principal in the secured design.
-- Intents can't be replayed across chains, contracts, lines or nonces. Changing the mandate or agent key bumps the line `epoch`, which kills older signed intents; owners can also cancel a single nonce.
+- Intents can't be replayed across chains, contracts, lines or nonces. Changing the mandate or agent key sets a fresh, unpredictable line `epoch`, which kills every intent signed before (including any pre-signed for a guessed future epoch); owners can also cancel a single nonce.
+- A statement's due date and grace are fixed when its cycle opens; changing parameters later never retimes it.
+- Lenders' fee income unlocks into share value over 24 hours, so a deposit made just before a payment earns nothing from it.
+- Only a line's owner (or a sponsor's owner) can deposit its collateral.
 - Refunds only restore budget to the mandate the hold was spent under.
 
-87 tests: unit, fuzz (512 runs) and 5 invariants (128 runs × 64 calls). See the audit history below.
+101 tests: unit, fuzz (512 runs) and 5 invariants (128 runs × 64 calls). See the audit history below.
 
 ## Not in v0 (on purpose)
 
@@ -51,6 +54,13 @@ Interest, unsecured credit, Wardens, staking, slashing, juror panels, the token,
 
 Known limitations: liquidation has no keeper reward, so Tally runs a keeper. The verifier and arbiter are trusted roles in v0 (an offline verifier lets unchecked holds release after the review window).
 
+**Trust assumptions.** "Depositors never lose principal" holds as long as the admin key is honest:
+- CreditPool's admin can grant `MANAGER_ROLE` to any address, and a manager can send idle cash anywhere with `fund` (up to the utilization cap).
+- TabManager's admin sets the treasury, the fee split, LTV and billing parameters (new cycles only), and wires the escrow once.
+- Escrow's arbiter can resolve a hold at any time.
+
+On mainnet the admin is a Safe behind a timelock, and `MANAGER_ROLE`'s admin is renounced once TabManager is wired, so no key can add a manager.
+
 ## Audit history
 
 | Date | Review | Result |
@@ -58,6 +68,7 @@ Known limitations: liquidation has no keeper reward, so Tally runs a keeper. The
 | 2026-10-22 | Internal review agent | 3 Medium, 5 Low; all fixed with regression tests |
 | 2026-10-23 | Independent review of sponsored lines | 0 High, 0 Medium, 1 Low (a cap of 0 removed the cap instead of freezing the line); fixed with a regression test |
 | 2026-10-22 | pashov solidity-auditor v4.1, 1 pass, 12 agents | 3 findings (confidence 75), 16 leads; all 3 findings fixed, 7 leads addressed. Report: `audits/2026-10-22-pashov-solidity-auditor.md` |
+| 2026-10-24 | IMD agent swarm (4 specialists and a judge, each finding reproduced) | 0 High, 0 Medium, 6 Low, 3 Info; 8 fixed with regression tests, 1 trust assumption documented. Report and response: `audits/2026-10-24-imd-swarm.md`, `audits/2026-10-24-imd-swarm-response.md` |
 
 ## Develop
 
@@ -75,9 +86,9 @@ forge test
 The Score engine publishes one Merkle root per epoch (the UTC day number) with `publish`. Each leaf is one payer's score and its five components, hashed in the OpenZeppelin StandardMerkleTree format with the epoch included, so a proof only works for its own epoch.
 
 - **Verify:** `verify(epoch, leaf, proof)` is a free view call.
-- **Record:** `record(epoch, leaf, proof)` stores a proven score; then `scoreOf(subject)` returns it with its `asOf` time. Anyone can record. A newer epoch always wins; check `asOf` against your own freshness limit.
+- **Record:** `record(epoch, leaf, proof)` stores a proven score; then `scoreOf(subject)` returns it with its `asOf` time. Anyone can record. Records only move forward in time, even after a revoke; check `asOf` against your own freshness limit.
 - **Revoke:** the admin can withdraw a bad snapshot. Its proofs stop verifying and its recorded scores read as missing; an older valid score can then be recorded.
-- **Safety:** epochs only move forward and can't be later than today, so a leaked publisher key can't block future snapshots. The admin can rotate the publisher.
+- **Safety:** epochs only move forward and can't be later than today, so a leaked publisher key can't block future snapshots. If the admin revokes the latest snapshot, the publisher can replace it the same day; scores recorded under the revoked root stay dead. The admin can rotate the publisher.
 
 Proofs come from the Score API (`GET /proof/:address`) or the snapshot file at the epoch's `uri`.
 

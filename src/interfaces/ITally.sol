@@ -7,6 +7,11 @@ interface IEscrow {
         returns (uint256 holdId);
 }
 
+/// @notice Escrow's wiring, checked once by TabManager.setEscrow.
+interface IEscrowWiring {
+    function manager() external view returns (ITabManager);
+}
+
 interface ITabManager {
     /// @notice Escrow released a hold to the seller and sent the fee to the manager:
     ///         the amount becomes billable to the owner and the fee is distributed.

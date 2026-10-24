@@ -60,7 +60,11 @@ abstract contract BaseTest is Test {
         vm.stopPrank();
     }
 
-    function _intent(uint256 amount, uint256 nonce, bool escrowed) internal view returns (TabManager.PaymentIntent memory p) {
+    function _intent(uint256 amount, uint256 nonce, bool escrowed)
+        internal
+        view
+        returns (TabManager.PaymentIntent memory p)
+    {
         p = TabManager.PaymentIntent({
             lineId: lineId,
             epoch: tabs.getLine(lineId).epoch,

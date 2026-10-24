@@ -13,7 +13,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {CreditPool} from "./CreditPool.sol";
-import {IEscrow} from "./interfaces/ITally.sol";
+import {IEscrow, IEscrowWiring} from "./interfaces/ITally.sol";
 
 /// @title TabManager
 /// @notice Secured credit lines ("tabs") for AI agents paying over x402.
@@ -41,7 +41,7 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
 
     struct Line {
         address owner;
-        uint32 epoch; // bumps on mandate or agent change; invalidates older signed intents
+        uint32 epoch; // changes, unpredictably, on mandate or agent change; invalidates older signed intents
         address agent;
         uint64 cycleEnd; // end of the open billing cycle, 0 if none open
         uint128 collateral;
@@ -49,6 +49,9 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         uint128 unbilled; // spent in the open cycle
         uint128 billed; // statement balance
         uint64 statementDue; // due date of the statement balance, 0 if none
+        uint64 liquidatableAt; // statementDue plus the grace in force when its cycle opened, 0 if none
+        uint32 cycleWindow; // paymentWindow when the open cycle opened
+        uint32 cycleGrace; // gracePeriod when the open cycle opened
     }
 
     struct Sponsor {
@@ -190,11 +193,16 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
     error NotSponsorOwner();
     error NotSponsored();
     error SponsoredLine();
+    error AmountTooSmall();
+    error EscrowMismatch();
 
     // ---------------------------------------------------------------- setup
 
     constructor(IERC20 usdc_, CreditPool pool_, address admin, address treasury_) EIP712("Tally TabManager", "1") {
-        if (address(usdc_) == address(0) || address(pool_) == address(0) || treasury_ == address(0)) {
+        if (
+            address(usdc_) == address(0) || address(pool_) == address(0) || treasury_ == address(0)
+                || admin == address(0)
+        ) {
             revert ZeroAddress();
         }
         usdc = usdc_;
@@ -238,11 +246,22 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         if (agent == address(0)) revert ZeroAddress();
         Line storage l = _lines[lineId];
         l.agent = agent;
-        emit AgentSet(lineId, agent, ++l.epoch);
+        emit AgentSet(lineId, agent, _newEpoch(lineId));
     }
 
-    function depositCollateral(uint256 lineId, uint256 amount) external nonReentrant {
-        if (_lines[lineId].owner == address(0)) revert UnknownLine();
+    /// @dev A fresh epoch that an agent cannot sign for in advance (a counter could be pre-signed: IMD swarm
+    ///      audit 2026-10-24, finding 3). Mixes the block's randomness, so the next value is unknown until the
+    ///      owner's transaction lands.
+    function _newEpoch(uint256 lineId) internal returns (uint32 e) {
+        Line storage l = _lines[lineId];
+        e = uint32(uint256(keccak256(abi.encode(lineId, l.epoch, block.prevrandao, block.timestamp, msg.sender))));
+        if (e == l.epoch) e ^= 1;
+        l.epoch = e;
+    }
+
+    /// @notice Only the line owner may deposit, so a deposit sent to a predicted id can't land in a line
+    ///         someone else opened first (IMD swarm audit 2026-10-24, finding 6).
+    function depositCollateral(uint256 lineId, uint256 amount) external nonReentrant onlyLineOwner(lineId) {
         if (sponsorOf[lineId] != 0) revert SponsoredLine();
         if (amount == 0) revert ZeroAmount();
         _lines[lineId].collateral += SafeCast.toUint128(amount);
@@ -268,14 +287,14 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         external
         onlyLineOwner(lineId)
     {
-        uint32 e = ++_lines[lineId].epoch;
+        uint32 e = _newEpoch(lineId);
         ++mandateVersion[lineId];
         mandates[lineId] = Mandate(maxPerPayment, budget, 0, validUntil, sellersRoot);
         emit MandateSet(lineId, e, maxPerPayment, budget, validUntil, sellersRoot);
     }
 
     function revokeMandate(uint256 lineId) external onlyLineOwner(lineId) {
-        uint32 e = ++_lines[lineId].epoch;
+        uint32 e = _newEpoch(lineId);
         ++mandateVersion[lineId];
         delete mandates[lineId];
         emit MandateRevoked(lineId, e);
@@ -296,8 +315,11 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         emit SponsorOpened(sponsorId, msg.sender);
     }
 
-    function depositSponsorCollateral(uint256 sponsorId, uint256 amount) external nonReentrant {
-        if (_sponsors[sponsorId].owner == address(0)) revert UnknownSponsor();
+    function depositSponsorCollateral(uint256 sponsorId, uint256 amount)
+        external
+        nonReentrant
+        onlySponsorOwner(sponsorId)
+    {
         if (amount == 0) revert ZeroAmount();
         _sponsors[sponsorId].collateral += SafeCast.toUint128(amount);
         usdc.safeTransferFrom(msg.sender, address(this), amount);
@@ -382,6 +404,7 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         mandates[p.lineId].spent += SafeCast.toUint128(p.amount);
 
         uint256 fee = Math.mulDiv(p.amount, sellerFeeBps, BPS, Math.Rounding.Ceil);
+        if (fee >= p.amount) revert AmountTooSmall(); // the seller must receive something
 
         if (p.escrowed) {
             address e = escrow;
@@ -452,8 +475,12 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
             if (l.unbilled > 0) {
                 l.billed += l.unbilled;
                 l.unbilled = 0;
-                // An older unpaid statement keeps its earlier due date.
-                if (l.statementDue == 0) l.statementDue = l.cycleEnd + paymentWindow;
+                // An older unpaid statement keeps its earlier due date. Terms are those in force when the cycle
+                // opened, so a later setParams never retimes a statement (IMD swarm audit 2026-10-24, finding 4).
+                if (l.statementDue == 0) {
+                    l.statementDue = l.cycleEnd + l.cycleWindow;
+                    l.liquidatableAt = l.statementDue + l.cycleGrace;
+                }
             }
             l.cycleEnd = 0;
         }
@@ -462,7 +489,11 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
     /// @dev Add a billable amount to the open cycle, opening one if needed.
     function _bill(uint256 lineId, Line storage l, uint256 amount) internal {
         _roll(l);
-        if (l.cycleEnd == 0) l.cycleEnd = SafeCast.toUint64(block.timestamp + billingPeriod);
+        if (l.cycleEnd == 0) {
+            l.cycleEnd = SafeCast.toUint64(block.timestamp + billingPeriod);
+            l.cycleWindow = paymentWindow;
+            l.cycleGrace = gracePeriod;
+        }
         l.unbilled += SafeCast.toUint128(amount);
         emit Billed(lineId, amount, l.cycleEnd);
     }
@@ -477,12 +508,15 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         _distributeFee(fee);
     }
 
-    /// @dev Pool share goes to the pool at once (raises share value); the rest waits for sweepFees.
+    /// @dev Pool share goes to the pool at once and unlocks into share value over a day; the rest waits for sweepFees.
     function _distributeFee(uint256 fee) internal {
         if (fee == 0) return;
         uint256 toPool = (fee * poolFeeShareBps) / BPS;
         uint256 toTreasury = fee - toPool;
-        if (toPool > 0) usdc.safeTransfer(address(pool), toPool);
+        if (toPool > 0) {
+            usdc.safeTransfer(address(pool), toPool);
+            pool.addYield(toPool); // unlocks over time, so a same-block deposit can't skim it
+        }
         feesAccrued += toTreasury;
         emit FeeDistributed(toPool, toTreasury);
     }
@@ -527,7 +561,7 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         uint256 fromBilled = Math.min(paid, l.billed);
         l.billed -= SafeCast.toUint128(fromBilled);
         l.unbilled -= SafeCast.toUint128(paid - fromBilled);
-        if (l.billed == 0) l.statementDue = 0;
+        if (l.billed == 0) (l.statementDue, l.liquidatableAt) = (0, 0);
         _sponsorSub(lineId, paid);
 
         usdc.safeTransferFrom(msg.sender, address(pool), paid);
@@ -543,7 +577,7 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
     function liquidate(uint256 lineId) external nonReentrant returns (uint256 seized, uint256 loss) {
         Line storage l = _lines[lineId];
         _roll(l);
-        if (!(l.billed > 0 && block.timestamp > uint256(l.statementDue) + gracePeriod)) revert NotPastDue();
+        if (!(l.billed > 0 && block.timestamp > l.liquidatableAt)) revert NotPastDue();
 
         uint256 owed = uint256(l.billed) + l.unbilled;
         uint256 sid = sponsorOf[lineId];
@@ -562,6 +596,7 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         l.billed = 0;
         l.unbilled = 0;
         l.statementDue = 0;
+        l.liquidatableAt = 0;
         l.cycleEnd = 0;
 
         if (seized > 0) {
@@ -625,15 +660,17 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
             if (unbilled > 0) {
                 billed += unbilled;
                 unbilled = 0;
-                if (dueAt == 0) dueAt = cycleEnd + paymentWindow;
+                if (dueAt == 0) dueAt = cycleEnd + l.cycleWindow;
             }
             cycleEnd = 0;
         }
     }
 
     function isPastDue(uint256 lineId) external view returns (bool) {
+        Line storage l = _lines[lineId];
         (uint256 billed,,, uint256 dueAt,) = statementOf(lineId);
-        return billed > 0 && block.timestamp > dueAt + gracePeriod;
+        uint256 at = l.statementDue != 0 ? l.liquidatableAt : dueAt + l.cycleGrace;
+        return billed > 0 && block.timestamp > at;
     }
 
     /// @notice Most the line could owe right now: own collateral times LTV, or for a sponsored line the
@@ -710,6 +747,7 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
     function setEscrow(address escrow_) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (escrow != address(0)) revert EscrowAlreadySet();
         if (escrow_ == address(0)) revert ZeroAddress();
+        if (address(IEscrowWiring(escrow_).manager()) != address(this)) revert EscrowMismatch();
         escrow = escrow_;
         emit EscrowSet(escrow_);
     }

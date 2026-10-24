@@ -38,6 +38,7 @@ contract ScoreRegistry is AccessControl {
         uint32 count; // number of leaves
         uint16 version; // scoring method version
         bool revoked;
+        uint32 generation; // bumped when a revoked epoch is replaced; records made under an older root stay dead
         string uri; // full snapshot with every leaf and proof (IPFS or HTTPS)
     }
 
@@ -46,6 +47,7 @@ contract ScoreRegistry is AccessControl {
         bool agentLikely;
         uint64 epoch;
         uint64 asOf;
+        uint32 generation; // the epoch's generation when this was recorded
     }
 
     mapping(uint64 epoch => Epoch) internal _epochs;
@@ -75,15 +77,20 @@ contract ScoreRegistry is AccessControl {
     // ---------------------------------------------------------------- publishing
 
     /// @notice Publish the scores for a new epoch. The epoch is a UTC day number (unix time / 1 day), so epochs
-    ///         only move forward and never past today: a leaked publisher key can't block future snapshots.
+    ///         only move forward and never past today. If the latest epoch was revoked, a corrected snapshot may
+    ///         replace it the same day; scores recorded under the revoked root stay dead (generation check).
+    ///         A leaked publisher key can therefore neither block future days nor leave today without a live root
+    ///         once the admin revokes its snapshot and the role is rotated.
     function publish(uint64 epoch, bytes32 root, uint64 asOf, uint32 count, uint16 version, string calldata uri)
         external
         onlyRole(PUBLISHER_ROLE)
     {
-        if (epoch <= latestEpoch) revert EpochNotNewer(epoch, latestEpoch);
+        Epoch storage e = _epochs[epoch];
+        bool replacesRevoked = epoch == latestEpoch && e.revoked;
+        if (epoch <= latestEpoch && !replacesRevoked) revert EpochNotNewer(epoch, latestEpoch);
         if (epoch > block.timestamp / 1 days) revert EpochInFuture(epoch);
         if (root == bytes32(0) || count == 0 || asOf == 0 || asOf > block.timestamp) revert BadSnapshot();
-        _epochs[epoch] = Epoch(root, asOf, count, version, false, uri);
+        _epochs[epoch] = Epoch(root, asOf, count, version, false, e.generation + 1, uri);
         latestEpoch = epoch;
         emit Published(epoch, root, asOf, count, version, uri);
     }
@@ -110,27 +117,34 @@ contract ScoreRegistry is AccessControl {
     }
 
     /// @notice Store a proven score so contracts can read it with `scoreOf`. Anyone may call.
+    ///         Records never move back in time: an epoch older than the subject's last recorded one is always
+    ///         rejected, even if that one was revoked. A revoked record reads as missing until a newer epoch,
+    ///         or a corrected snapshot of the same epoch, is recorded.
     function record(uint64 epoch, ScoreLeaf calldata leaf, bytes32[] calldata proof) external {
         Epoch storage e = _epochs[epoch];
         if (e.root == bytes32(0)) revert UnknownEpoch(epoch);
         if (e.revoked) revert EpochRevoked(epoch);
         if (!MerkleProof.verifyCalldata(proof, e.root, leafHash(epoch, leaf))) revert InvalidProof();
         Recorded storage r = _recorded[leaf.subject];
-        // A newer record wins, unless its epoch was revoked: then an older valid score may replace it.
-        if (epoch <= r.epoch && !_epochs[r.epoch].revoked) revert StaleRecord(epoch, r.epoch);
-        _recorded[leaf.subject] = Recorded(leaf.score, leaf.agentLikely, epoch, e.asOf);
+        if (epoch < r.epoch || (epoch == r.epoch && _live(r))) revert StaleRecord(epoch, r.epoch);
+        _recorded[leaf.subject] = Recorded(leaf.score, leaf.agentLikely, epoch, e.asOf, e.generation);
         emit ScoreRecorded(leaf.subject, epoch, leaf.score, leaf.agentLikely);
     }
 
-    /// @notice The latest recorded score for `subject`. `found` is false if none is recorded or its epoch
-    ///         was revoked. Callers should check `asOf` against their own freshness limit.
+    function _live(Recorded memory r) internal view returns (bool) {
+        Epoch storage e = _epochs[r.epoch];
+        return r.epoch != 0 && !e.revoked && e.generation == r.generation;
+    }
+
+    /// @notice The latest recorded score for `subject`. `found` is false if none is recorded, its epoch was
+    ///         revoked, or the epoch was replaced by a corrected snapshot after it was recorded. Callers should check `asOf` against their own freshness limit.
     function scoreOf(address subject)
         external
         view
         returns (bool found, uint16 score, bool agentLikely, uint64 epoch, uint64 asOf)
     {
         Recorded memory r = _recorded[subject];
-        if (r.epoch == 0 || _epochs[r.epoch].revoked) return (false, 0, false, 0, 0);
+        if (!_live(r)) return (false, 0, false, 0, 0);
         return (true, r.score, r.agentLikely, r.epoch, r.asOf);
     }
 

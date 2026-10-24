@@ -53,12 +53,15 @@ contract Escrow is AccessControl, ReentrancyGuard {
     uint256 public nextHoldId = 1;
     mapping(uint256 => Hold) public holds;
 
-    event Opened(uint256 indexed holdId, uint256 indexed lineId, address indexed seller, uint256 amount, bytes32 resource);
+    event Opened(
+        uint256 indexed holdId, uint256 indexed lineId, address indexed seller, uint256 amount, bytes32 resource
+    );
     event Flagged(uint256 indexed holdId, bytes32 reasonHash);
     event Released(uint256 indexed holdId, address indexed seller, uint256 net, uint256 fee);
     event Refunded(uint256 indexed holdId, uint256 indexed lineId, uint256 amount);
     event WindowsSet(uint64 reviewWindow, uint64 rulingWindow);
 
+    error ZeroAddress();
     error OnlyManager();
     error WrongStatus(Status status);
     error ReviewOpen();
@@ -67,6 +70,9 @@ contract Escrow is AccessControl, ReentrancyGuard {
     error BadParams();
 
     constructor(IERC20 usdc_, ITabManager manager_, address admin) {
+        if (address(usdc_) == address(0) || address(manager_) == address(0) || admin == address(0)) {
+            revert ZeroAddress();
+        }
         usdc = usdc_;
         manager = manager_;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);

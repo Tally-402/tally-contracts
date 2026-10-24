@@ -19,10 +19,13 @@ contract TabManagerTest is BaseTest {
         assertEq(tabs.feesAccrued(), 0.2e6, "half the fee waits for the treasury");
         assertEq(_outstanding(lineId), 40 * USDC);
         assertEq(pool.outstanding(), 40 * USDC);
-        assertEq(pool.totalAssets(), assetsBefore + 0.2e6, "lenders earn half the fee");
+        assertEq(pool.totalAssets(), assetsBefore, "fee income is locked at first");
+        assertEq(pool.unvestedYield(), 0.2e6, "lenders' half of the fee is locked");
         assertEq(_cycleEnd(lineId), block.timestamp + 7 days, "opens a weekly cycle");
         assertEq(_dueAt(lineId), 0, "nothing is due until the cycle closes");
         assertEq(tabs.availableCredit(lineId), 960 * USDC);
+        vm.warp(block.timestamp + 1 days);
+        assertEq(pool.totalAssets(), assetsBefore + 0.2e6, "lenders earn half the fee once it unlocks");
     }
 
     function test_Pay_ByAnySubmitter() public {
@@ -69,7 +72,9 @@ contract TabManagerTest is BaseTest {
     }
 
     function test_RevertWhen_AboveBudget() public {
-        for (uint256 i = 1; i <= 5; i++) _pay(_intent(100 * USDC, i, false));
+        for (uint256 i = 1; i <= 5; i++) {
+            _pay(_intent(100 * USDC, i, false));
+        }
         _payExpectRevert(_intent(1, 6, false), abi.encodeWithSelector(TabManager.AboveBudget.selector));
     }
 
@@ -86,8 +91,13 @@ contract TabManagerTest is BaseTest {
 
     function test_RevertWhen_AboveCreditLimit() public {
         vm.prank(owner);
-        tabs.setMandate(lineId, uint128(5_000 * USDC), uint128(5_000 * USDC), uint64(block.timestamp + 1 days), bytes32(0));
-        _payExpectRevert(_intent(1_001 * USDC, 1, false), abi.encodeWithSelector(TabManager.AboveCreditLimit.selector, 1_001 * USDC, 1_000 * USDC));
+        tabs.setMandate(
+            lineId, uint128(5_000 * USDC), uint128(5_000 * USDC), uint64(block.timestamp + 1 days), bytes32(0)
+        );
+        _payExpectRevert(
+            _intent(1_001 * USDC, 1, false),
+            abi.encodeWithSelector(TabManager.AboveCreditLimit.selector, 1_001 * USDC, 1_000 * USDC)
+        );
     }
 
     function test_SellerAllowlist() public {
@@ -194,7 +204,7 @@ contract TabManagerTest is BaseTest {
 
     function test_Liquidate_AfterGrace_NoLossToPool() public {
         _pay(_intent(100 * USDC, 1, false));
-        uint256 assetsBefore = pool.totalAssets();
+        uint256 assetsBefore = pool.totalAssets() + pool.unvestedYield(); // the fee has unlocked by liquidation
 
         vm.warp(block.timestamp + 7 days + 3 days + 2 days);
         vm.expectRevert(TabManager.NotPastDue.selector);
@@ -232,11 +242,12 @@ contract TabManagerTest is BaseTest {
 
     function test_RevertWhen_NonManagerFundsPool() public {
         vm.expectRevert(
-            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, address(this), pool.MANAGER_ROLE())
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, address(this), pool.MANAGER_ROLE()
+            )
         );
         pool.fund(address(this), 1);
     }
-
 
     // ------------------------------------------------------------ review regressions
 
@@ -314,7 +325,7 @@ contract TabManagerTest is BaseTest {
     // ------------------------------------------------------------ fuzz
 
     function testFuzz_PayThenRepay(uint256 amount, uint256 repayAmount) public {
-        amount = bound(amount, 1, 100 * USDC);
+        amount = bound(amount, 100, 100 * USDC); // below 100 units the 1% fee would take everything
         repayAmount = bound(repayAmount, 1, 200 * USDC);
         _pay(_intent(amount, 1, false));
         vm.prank(owner);
@@ -330,7 +341,16 @@ contract TabManagerTest is BaseTest {
         feeBps = uint16(bound(feeBps, 0, 500));
         vm.prank(admin);
         tabs.setParams(10_000, feeBps, 7 days, 3 days, 2 days);
+        uint256 fee = (amount * feeBps + 9_999) / 10_000;
+        if (fee >= amount) {
+            TabManager.PaymentIntent memory p = _intent(amount, 1, false);
+            bytes memory sig = _sign(p, agentPk);
+            vm.expectRevert(TabManager.AmountTooSmall.selector);
+            tabs.pay(p, sig, new bytes32[](0));
+            return;
+        }
         _pay(_intent(amount, 1, false));
+        assertGt(usdc.balanceOf(seller), 0, "seller always receives something");
         uint256 poolGain = pool.idle() - (1_000_000 * USDC - amount);
         assertEq(usdc.balanceOf(seller) + tabs.feesAccrued() + poolGain, amount, "every unit accounted for");
         assertGe(amount - usdc.balanceOf(seller), feeBps == 0 ? 0 : 1, "fee rounds up");
@@ -340,8 +360,12 @@ contract TabManagerTest is BaseTest {
 contract CreditPoolTest is BaseTest {
     function test_WithdrawLimitedToIdle() public {
         vm.prank(owner);
-        tabs.setMandate(lineId, uint128(1_000 * USDC), uint128(1_000 * USDC), uint64(block.timestamp + 1 days), bytes32(0));
+        tabs.setMandate(
+            lineId, uint128(1_000 * USDC), uint128(1_000 * USDC), uint64(block.timestamp + 1 days), bytes32(0)
+        );
         _pay(_intent(1_000 * USDC, 1, false));
+        assertEq(pool.totalAssets(), 1_000_000 * USDC, "fee still locked");
+        vm.warp(block.timestamp + 1 days);
         assertEq(pool.maxWithdraw(lp), 999_005 * USDC);
         assertEq(pool.totalAssets(), 1_000_005 * USDC);
     }
@@ -390,8 +414,14 @@ contract CreditPoolTest is BaseTest {
         vm.stopPrank();
 
         TabManager.PaymentIntent memory p = TabManager.PaymentIntent({
-            lineId: id, epoch: tabs.getLine(id).epoch, seller: whale, amount: 950_000 * USDC,
-            resource: bytes32(0), escrowed: false, nonce: 1, deadline: block.timestamp + 1 hours
+            lineId: id,
+            epoch: tabs.getLine(id).epoch,
+            seller: whale,
+            amount: 950_000 * USDC,
+            resource: bytes32(0),
+            escrowed: false,
+            nonce: 1,
+            deadline: block.timestamp + 1 hours
         });
         bytes memory sig = _sign(p, pk);
         vm.expectRevert(abi.encodeWithSelector(CreditPool.UtilizationCap.selector, 950_000 * USDC, 900_000 * USDC));
@@ -431,9 +461,12 @@ contract CreditPoolTest is BaseTest {
     /// Lenders who deposit earn: share value rises with every fee-paying payment.
     function test_LenderShareValue_GrowsWithFees() public {
         uint256 before = pool.convertToAssets(1e12);
-        for (uint256 i = 1; i <= 5; i++) _pay(_intent(100 * USDC, i, false));
+        for (uint256 i = 1; i <= 5; i++) {
+            _pay(_intent(100 * USDC, i, false));
+        }
         vm.prank(owner);
         tabs.repay(lineId, 500 * USDC);
+        vm.warp(block.timestamp + 1 days);
         assertGt(pool.convertToAssets(1e12), before);
         assertEq(pool.totalAssets(), 1_000_000 * USDC + 2.5e6, "half of 5 USDC in fees");
     }
