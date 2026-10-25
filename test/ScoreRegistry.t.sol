@@ -46,7 +46,7 @@ contract ScoreRegistryTest is Test {
         bytes32 hb = _hash(epoch, b);
         bytes32 root = ha < hb ? keccak256(abi.encode(ha, hb)) : keccak256(abi.encode(hb, ha));
         vm.prank(publisher);
-        reg.publish(epoch, root, uint64(block.timestamp), 2, 1, "ipfs://snapshot");
+        reg.publish(epoch, root, uint64(vm.getBlockTimestamp()), 2, 1, "ipfs://snapshot");
         pa = new bytes32[](1);
         pa[0] = hb;
         pb = new bytes32[](1);
@@ -62,7 +62,7 @@ contract ScoreRegistryTest is Test {
         assertEq(score, 812);
         assertTrue(agentLikely);
         assertEq(epoch, 1);
-        assertEq(asOf, block.timestamp);
+        assertEq(asOf, vm.getBlockTimestamp());
     }
 
     function test_TamperedLeafFails() public {
@@ -74,7 +74,7 @@ contract ScoreRegistryTest is Test {
 
     function test_LeafBoundToEpoch() public {
         (bytes32[] memory pa,) = _publishTwo(1, _leaf(alice, 812), _leaf(bob, 300));
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         _publishTwo(2, _leaf(alice, 500), _leaf(bob, 300));
         assertFalse(reg.verify(2, _leaf(alice, 812), pa), "an epoch-1 proof must not pass in epoch 2");
     }
@@ -86,27 +86,27 @@ contract ScoreRegistryTest is Test {
             )
         );
         vm.prank(alice);
-        reg.publish(1, bytes32(uint256(1)), uint64(block.timestamp), 1, 1, "");
+        reg.publish(1, bytes32(uint256(1)), uint64(vm.getBlockTimestamp()), 1, 1, "");
     }
 
     function test_EpochsOnlyMoveForward() public {
         _publishTwo(5, _leaf(alice, 812), _leaf(bob, 300));
         vm.prank(publisher);
         vm.expectRevert(abi.encodeWithSelector(ScoreRegistry.EpochNotNewer.selector, 5, 5));
-        reg.publish(5, bytes32(uint256(1)), uint64(block.timestamp), 1, 1, "");
+        reg.publish(5, bytes32(uint256(1)), uint64(vm.getBlockTimestamp()), 1, 1, "");
         vm.prank(publisher);
         vm.expectRevert(abi.encodeWithSelector(ScoreRegistry.EpochNotNewer.selector, 4, 5));
-        reg.publish(4, bytes32(uint256(1)), uint64(block.timestamp), 1, 1, "");
+        reg.publish(4, bytes32(uint256(1)), uint64(vm.getBlockTimestamp()), 1, 1, "");
     }
 
     function test_RevertWhen_BadSnapshot() public {
         vm.startPrank(publisher);
         vm.expectRevert(ScoreRegistry.BadSnapshot.selector);
-        reg.publish(1, bytes32(0), uint64(block.timestamp), 1, 1, "");
+        reg.publish(1, bytes32(0), uint64(vm.getBlockTimestamp()), 1, 1, "");
         vm.expectRevert(ScoreRegistry.BadSnapshot.selector);
-        reg.publish(1, bytes32(uint256(1)), uint64(block.timestamp + 1), 1, 1, "");
+        reg.publish(1, bytes32(uint256(1)), uint64(vm.getBlockTimestamp() + 1), 1, 1, "");
         vm.expectRevert(ScoreRegistry.BadSnapshot.selector);
-        reg.publish(1, bytes32(uint256(1)), uint64(block.timestamp), 0, 1, "");
+        reg.publish(1, bytes32(uint256(1)), uint64(vm.getBlockTimestamp()), 0, 1, "");
         vm.stopPrank();
     }
 
@@ -131,7 +131,7 @@ contract ScoreRegistryTest is Test {
 
     function test_OlderEpochCannotOverwriteNewer() public {
         (bytes32[] memory p1,) = _publishTwo(1, _leaf(alice, 812), _leaf(bob, 300));
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         (bytes32[] memory p2,) = _publishTwo(2, _leaf(alice, 640), _leaf(bob, 300));
         reg.record(2, _leaf(alice, 640), p2);
         vm.expectRevert(abi.encodeWithSelector(ScoreRegistry.StaleRecord.selector, 1, 2));
@@ -143,9 +143,9 @@ contract ScoreRegistryTest is Test {
     /// IMD swarm audit 2026-10-24, finding 2: after a revoke, an older epoch must not roll a subject back.
     function test_AfterRevoke_OlderEpochCannotRollBack() public {
         (bytes32[] memory p1,) = _publishTwo(1, _leaf(alice, 950), _leaf(bob, 300));
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         (bytes32[] memory p2,) = _publishTwo(2, _leaf(alice, 400), _leaf(bob, 300));
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         (bytes32[] memory p3,) = _publishTwo(3, _leaf(alice, 350), _leaf(bob, 300));
         reg.record(2, _leaf(alice, 400), p2);
         reg.record(3, _leaf(alice, 350), p3);
@@ -161,7 +161,7 @@ contract ScoreRegistryTest is Test {
 
     /// IMD swarm audit 2026-10-24, finding 1: a revoked latest epoch can be replaced the same day.
     function test_CorrectedSnapshotReplacesRevokedToday() public {
-        uint64 today = uint64(block.timestamp / 1 days);
+        uint64 today = uint64(vm.getBlockTimestamp() / 1 days);
         (bytes32[] memory bad,) = _publishTwo(today, _leaf(alice, 999), _leaf(bob, 300));
         reg.record(today, _leaf(alice, 999), bad);
         vm.prank(admin);
@@ -188,25 +188,25 @@ contract ScoreRegistryTest is Test {
         // A live epoch still cannot be overwritten, and older days stay closed.
         vm.prank(publisher);
         vm.expectRevert(abi.encodeWithSelector(ScoreRegistry.EpochNotNewer.selector, today, today));
-        reg.publish(today, bytes32(uint256(7)), uint64(block.timestamp), 1, 1, "");
+        reg.publish(today, bytes32(uint256(7)), uint64(vm.getBlockTimestamp()), 1, 1, "");
     }
 
     function test_RevertWhen_ReplacingOlderRevokedEpoch() public {
         _publishTwo(1, _leaf(alice, 812), _leaf(bob, 300));
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         _publishTwo(2, _leaf(alice, 640), _leaf(bob, 300));
         vm.prank(admin);
         reg.revoke(1);
         vm.prank(publisher);
         vm.expectRevert(abi.encodeWithSelector(ScoreRegistry.EpochNotNewer.selector, 1, 2));
-        reg.publish(1, bytes32(uint256(7)), uint64(block.timestamp), 1, 1, "");
+        reg.publish(1, bytes32(uint256(7)), uint64(vm.getBlockTimestamp()), 1, 1, "");
     }
 
     function test_RevertWhen_EpochInFuture() public {
-        uint64 tomorrow = uint64(block.timestamp / 1 days + 1);
+        uint64 tomorrow = uint64(vm.getBlockTimestamp() / 1 days + 1);
         vm.prank(publisher);
         vm.expectRevert(abi.encodeWithSelector(ScoreRegistry.EpochInFuture.selector, tomorrow));
-        reg.publish(tomorrow, bytes32(uint256(1)), uint64(block.timestamp), 1, 1, "");
+        reg.publish(tomorrow, bytes32(uint256(1)), uint64(vm.getBlockTimestamp()), 1, 1, "");
     }
 
     function testFuzz_AnyOtherScoreFails(uint16 wrong) public {

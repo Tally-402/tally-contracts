@@ -6,9 +6,10 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {CreditPool} from "../src/CreditPool.sol";
 import {TabManager} from "../src/TabManager.sol";
 import {Escrow} from "../src/Escrow.sol";
+import {TabLens} from "../src/TabLens.sol";
 import {ITabManager} from "../src/interfaces/ITally.sol";
 
-/// @notice Deploys and wires CreditPool, TabManager and Escrow.
+/// @notice Deploys and wires CreditPool, TabManager and Escrow, plus the read-only TabLens.
 ///
 /// Env:
 ///   USDC         token address (Base Sepolia Circle USDC: 0x036CbD53842c5426634e7929541eC2318f3dCF7e, verify before use)
@@ -20,7 +21,7 @@ import {ITabManager} from "../src/interfaces/ITally.sol";
 /// Run (keys stay in your keystore, never in env):
 ///   forge script script/Deploy.s.sol --rpc-url $BASE_SEPOLIA_RPC --account deployer --broadcast
 contract Deploy is Script {
-    function run() external returns (CreditPool pool, TabManager tabs, Escrow escrow) {
+    function run() external returns (CreditPool pool, TabManager tabs, Escrow escrow, TabLens lens) {
         IERC20 usdc = IERC20(vm.envAddress("USDC"));
         address admin = vm.envAddress("ADMIN");
         address treasury = vm.envAddress("TREASURY");
@@ -35,6 +36,7 @@ contract Deploy is Script {
         pool = new CreditPool(usdc, deployer, cap);
         tabs = new TabManager(usdc, pool, deployer, treasury);
         escrow = new Escrow(usdc, ITabManager(address(tabs)), deployer);
+        lens = new TabLens(tabs);
 
         pool.grantRole(pool.MANAGER_ROLE(), address(tabs));
         tabs.setEscrow(address(escrow));
@@ -54,5 +56,6 @@ contract Deploy is Script {
         console.log("CreditPool", address(pool));
         console.log("TabManager", address(tabs));
         console.log("Escrow    ", address(escrow));
+        console.log("TabLens   ", address(lens));
     }
 }

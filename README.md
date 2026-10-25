@@ -42,9 +42,12 @@ Things to know: one agent's default reduces the shared collateral for every agen
 - A statement's due date and grace are fixed when its cycle opens; changing parameters later never retimes it.
 - Lenders' fee income unlocks into share value over 24 hours, so a deposit made just before a payment earns nothing from it.
 - Only a line's owner (or a sponsor's owner) can deposit its collateral.
+- A worker key (sub-tab) spends only within its cap and expiry, only in the epoch it was granted in, and always inside the line's mandate.
+- A sweep only takes from what the earner is paid through Tally, only for a line whose agent or owner the earner still is, and never more than the line owes.
+- A vouched line's manager can run it but can't withdraw the sponsor's stake, change its cap or appoint another manager.
 - Refunds only restore budget to the mandate the hold was spent under.
 
-101 tests: unit, fuzz (512 runs) and 5 invariants (128 runs × 64 calls). See the audit history below.
+134 tests: unit, fuzz (512 runs) and 5 invariants (128 runs × 64 calls). See the audit history below.
 
 ## Not in v0 (on purpose)
 
@@ -70,6 +73,21 @@ On mainnet the admin is a Safe behind a timelock, and `MANAGER_ROLE`'s admin is 
 | 2026-10-22 | pashov solidity-auditor v4.1, 1 pass, 12 agents | 3 findings (confidence 75), 16 leads; all 3 findings fixed, 7 leads addressed. Report: `audits/2026-10-22-pashov-solidity-auditor.md` |
 | 2026-10-24 | IMD agent swarm (4 specialists and a judge, each finding reproduced) | 0 High, 0 Medium, 6 Low, 3 Info; 8 fixed with regression tests, 1 trust assumption documented. Report and response: `audits/2026-10-24-imd-swarm.md`, `audits/2026-10-24-imd-swarm-response.md` |
 
+### Sub-tabs, self-funding and vouching (2026-10-24, not yet audited)
+
+- **Sub-tabs:** `setDelegate(lineId, worker, cap, validUntil)` by the line's agent, owner or manager. `pay` accepts intents signed by an active worker key (recovered with ECDSA; workers are EOAs), charges its cap and emits `DelegatePaid`. Grants are tied to the line's epoch.
+- **Self-funding:** `setSweep(lineId, earner, bps)`. On a direct Tally payment to `earner`, `bps` of the payout repays the earner's line (`AutoRepaid`) and goes to the pool. Escrowed payments are released by Escrow and are not swept.
+- **Vouching:** `setManager` / `acceptManager` on a sponsored line hands day-to-day control (mandate, agent, workers, sweeps, nonces) to the manager. On a managed line, `voucherFeeBps` (default 50%) of the treasury's fee share accrues to the sponsor's owner (`claimVoucherFees`).
+- `statementOf`, `isPastDue`, `creditLimit` and `availableCredit` moved to `TabLens`, and the project compiles with the IR pipeline (`via_ir`), to keep TabManager at 19.3 KB.
+
+These changes and the compiler switch come after the IMD audit and need their own review before mainnet.
+
+### Prepaid accounts (2026-10-25, not yet audited)
+
+- **`AgentAccounts`** (standalone, no admin, no wiring): owners `deposit` / `depositFor` USDC (credited by the amount actually received) and `withdraw` at any time, even while paused. `setAgent(agent, floor, target, dailyCap)` sets a refill rule per agent wallet; `refill(owner, agent)` is permissionless and sends `target - balance` when the wallet is below `floor` (a floor of 0 means "only when empty"), limited by the day's remaining cap and the owner's balance. `setPaused` stops every refill for that owner. Rules are per owner, so registering someone else's agent never touches their balance.
+- Risk bound: a leaked agent key can drain at most that agent's daily cap per UTC day, by spending its wallet and triggering refills.
+- **Earn:** `setEarn(vault, buffer)` (owner's choice of any ERC-4626 vault whose `asset()` is this USDC). Shares are tracked per owner; every deposit and redeem is credited by measured balance changes, and approvals are exact and reset. Refills and withdrawals pull from the vault up to `maxWithdraw`/`maxRedeem`; switching or leaving a vault reverts with `VaultIlliquid` if the old position can't be paid out in full. Trust: an owner who picks a bad vault can lose its own supplied balance; other owners' cash and shares are unaffected.
+
 ## Develop
 
 ```
@@ -80,6 +98,15 @@ git clone --depth 1 --branch v1.9.4 https://github.com/foundry-rs/forge-std lib/
 forge build
 forge test
 ```
+
+## Wardens (Ethereum)
+
+2,000 Tally Wardens, minted in one wave. Two contracts, each small enough to deploy on Ethereum after Glamsterdam's code-size gas increase:
+
+- `Wardens`: the collection. Role by token id (`id % 3`: Underwriter, Juror, Verifier). `activate(tokenId, agentURI)` gives a Warden its ERC-8004 identity, registered and held by the collection and tagged `tally.warden = (collection, tokenId)`. The holder (or an approved operator) manages the agent: `setAgentURI`, `setAgentWallet` (the wallet proves control with its signature), `unsetAgentWallet`, `setAgentMetadata`. A transfer clears the agent wallet; the identity and its record stay with the Warden. Art comes from a replaceable renderer or base URI until `freezeMetadata()`; EIP-4906 events tell marketplaces to refresh.
+- `WardenMint`: the sale. An allowlist window (Merkle root of addresses), then a public window, one price, a per-wallet limit. Terms lock when the allowlist opens. Proceeds go only to the first-loss receiver. The owner can close minting for good afterwards.
+
+Deploy: `script/DeployWardens.s.sol` (env `OWNER`, `FIRST_LOSS`; it skips local simulation because of the new code gas price).
 
 ## ScoreRegistry
 

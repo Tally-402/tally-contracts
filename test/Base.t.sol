@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {CreditPool} from "../src/CreditPool.sol";
 import {TabManager} from "../src/TabManager.sol";
 import {Escrow} from "../src/Escrow.sol";
+import {TabLens} from "../src/TabLens.sol";
 import {ITabManager} from "../src/interfaces/ITally.sol";
 import {MockUSDC} from "./mocks/Mocks.sol";
 
@@ -15,6 +16,7 @@ abstract contract BaseTest is Test {
     CreditPool internal pool;
     TabManager internal tabs;
     Escrow internal escrow;
+    TabLens internal lens;
 
     address internal admin = makeAddr("admin");
     address internal treasury = makeAddr("treasury");
@@ -35,6 +37,7 @@ abstract contract BaseTest is Test {
         pool = new CreditPool(usdc, admin, 0);
         tabs = new TabManager(usdc, pool, admin, treasury);
         escrow = new Escrow(usdc, ITabManager(address(tabs)), admin);
+        lens = new TabLens(tabs);
 
         vm.startPrank(admin);
         pool.grantRole(pool.MANAGER_ROLE(), address(tabs));
@@ -56,7 +59,9 @@ abstract contract BaseTest is Test {
         usdc.approve(address(tabs), type(uint256).max);
         lineId = tabs.openLine(agent);
         tabs.depositCollateral(lineId, 1_000 * USDC);
-        tabs.setMandate(lineId, uint128(100 * USDC), uint128(500 * USDC), uint64(block.timestamp + 30 days), bytes32(0));
+        tabs.setMandate(
+            lineId, uint128(100 * USDC), uint128(500 * USDC), uint64(vm.getBlockTimestamp() + 30 days), bytes32(0)
+        );
         vm.stopPrank();
     }
 
@@ -73,7 +78,7 @@ abstract contract BaseTest is Test {
             resource: keccak256("GET https://api.example/data"),
             escrowed: escrowed,
             nonce: nonce,
-            deadline: block.timestamp + 1 hours
+            deadline: vm.getBlockTimestamp() + 1 hours
         });
     }
 
@@ -102,10 +107,10 @@ abstract contract BaseTest is Test {
     }
 
     function _dueAt(uint256 id) internal view returns (uint256 d) {
-        (,,, d,) = tabs.statementOf(id);
+        (,,, d,) = lens.statementOf(id);
     }
 
     function _cycleEnd(uint256 id) internal view returns (uint256 c) {
-        (,,,, c) = tabs.statementOf(id);
+        (,,,, c) = lens.statementOf(id);
     }
 }

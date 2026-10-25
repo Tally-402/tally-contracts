@@ -33,7 +33,7 @@ contract EscrowTest is BaseTest {
         uint256 id = _pay(_intent(80 * USDC, 1, true));
         vm.expectRevert(Escrow.ReviewOpen.selector);
         escrow.claim(id);
-        vm.warp(block.timestamp + 1 days + 1);
+        vm.warp(vm.getBlockTimestamp() + 1 days + 1);
         escrow.claim(id);
         assertEq(usdc.balanceOf(seller), 79.2e6);
     }
@@ -67,7 +67,7 @@ contract EscrowTest is BaseTest {
 
     function test_RevertWhen_FlagAfterWindow() public {
         uint256 id = _pay(_intent(80 * USDC, 1, true));
-        vm.warp(block.timestamp + 1 days + 1);
+        vm.warp(vm.getBlockTimestamp() + 1 days + 1);
         vm.prank(verifier);
         vm.expectRevert(Escrow.ReviewClosed.selector);
         escrow.flag(id, bytes32(0));
@@ -88,11 +88,11 @@ contract EscrowTest is BaseTest {
         uint256 id = _pay(_intent(80 * USDC, 1, true));
         vm.prank(verifier);
         escrow.flag(id, bytes32(0));
-        vm.warp(block.timestamp + 6 days);
-        assertFalse(tabs.isPastDue(lineId));
+        vm.warp(vm.getBlockTimestamp() + 6 days);
+        assertFalse(lens.isPastDue(lineId));
         vm.expectRevert(TabManager.NotPastDue.selector);
         tabs.liquidate(lineId);
-        (uint256 billed, uint256 unbilled, uint256 held,,) = tabs.statementOf(lineId);
+        (uint256 billed, uint256 unbilled, uint256 held,,) = lens.statementOf(lineId);
         assertEq(billed + unbilled, 0);
         assertEq(held, 80 * USDC);
     }
@@ -103,7 +103,7 @@ contract EscrowTest is BaseTest {
         uint256 id = _pay(_intent(80 * USDC, 2, true));
         vm.prank(verifier);
         escrow.flag(id, bytes32(0));
-        vm.warp(block.timestamp + 12 days + 1);
+        vm.warp(vm.getBlockTimestamp() + 12 days + 1);
         (uint256 seized,) = tabs.liquidate(lineId);
         assertEq(seized, 10 * USDC);
         assertEq(_outstanding(lineId), 80 * USDC);
@@ -119,18 +119,18 @@ contract EscrowTest is BaseTest {
         uint256 id = _pay(_intent(80 * USDC, 1, true));
         vm.prank(verifier);
         escrow.pass(id);
-        (uint256 billed, uint256 unbilled, uint256 held,, uint256 cycleEnd) = tabs.statementOf(lineId);
+        (uint256 billed, uint256 unbilled, uint256 held,, uint256 cycleEnd) = lens.statementOf(lineId);
         assertEq(held, 0);
         assertEq(unbilled, 80 * USDC);
         assertEq(billed, 0);
-        assertEq(cycleEnd, block.timestamp + 7 days);
+        assertEq(cycleEnd, vm.getBlockTimestamp() + 7 days);
     }
 
     /// M-1: a seller that cannot receive USDC no longer locks funds; the arbiter refunds.
     function test_BlacklistedSeller_ArbiterRefunds() public {
         uint256 id = _pay(_intent(80 * USDC, 1, true));
         usdc.setBlacklisted(seller, true);
-        vm.warp(block.timestamp + 1 days + 1);
+        vm.warp(vm.getBlockTimestamp() + 1 days + 1);
         vm.expectRevert();
         escrow.claim(id);
         vm.prank(arbiter);
@@ -146,7 +146,7 @@ contract EscrowTest is BaseTest {
         escrow.flag(id, bytes32(0));
         vm.expectRevert(Escrow.RulingOpen.selector);
         escrow.expire(id);
-        vm.warp(block.timestamp + 7 days + 1);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
         escrow.expire(id);
         assertEq(_outstanding(lineId), 0);
     }
@@ -155,7 +155,9 @@ contract EscrowTest is BaseTest {
     function test_OldEpochRefund_DoesNotRestoreNewBudget() public {
         uint256 id = _pay(_intent(80 * USDC, 1, true));
         vm.prank(owner);
-        tabs.setMandate(lineId, uint128(100 * USDC), uint128(100 * USDC), uint64(block.timestamp + 1 days), bytes32(0));
+        tabs.setMandate(
+            lineId, uint128(100 * USDC), uint128(100 * USDC), uint64(vm.getBlockTimestamp() + 1 days), bytes32(0)
+        );
         _pay(_intent(100 * USDC, 2, false));
         vm.prank(verifier);
         escrow.flag(id, bytes32(0));
@@ -184,10 +186,10 @@ contract EscrowTest is BaseTest {
         escrow.flag(id, bytes32(0));
         vm.prank(admin);
         escrow.setWindows(1 days, 1 days);
-        vm.warp(block.timestamp + 2 days);
+        vm.warp(vm.getBlockTimestamp() + 2 days);
         vm.expectRevert(Escrow.RulingOpen.selector);
         escrow.expire(id);
-        vm.warp(block.timestamp + 5 days + 1);
+        vm.warp(vm.getBlockTimestamp() + 5 days + 1);
         escrow.expire(id);
     }
 

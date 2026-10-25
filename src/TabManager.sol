@@ -9,6 +9,7 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
@@ -122,6 +123,32 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
     mapping(uint256 => uint128) public lineCap;
     uint128 public constant NO_CAP = type(uint128).max;
 
+    // ---------------------------------------------------------------- sub-tabs, self-funding, vouching
+
+    /// @notice A worker key that may spend on a line (sub-tab). Valid only in the epoch it was set in, so any
+    ///         mandate or agent change revokes every worker at once. The line's mandate still applies on top.
+    struct Delegate {
+        uint128 cap; // most this worker may spend in total
+        uint128 spent;
+        uint64 validUntil;
+        uint32 epoch;
+    }
+
+    mapping(uint256 lineId => mapping(address worker => Delegate)) public delegates;
+
+    /// @notice Self-funding: when `earner` is paid through Tally, `sweepBps` of its payout repays `sweepLine`.
+    mapping(address earner => uint256) public sweepLine;
+    mapping(address earner => uint16) public sweepBps;
+
+    /// @notice Vouching: someone else runs a sponsored line day to day (mandate, agent, workers, sweeps), while the
+    ///         sponsor that vouched keeps its stake, the cap and the risk.
+    mapping(uint256 lineId => address) public managerOf;
+    mapping(uint256 lineId => address) public pendingManagerOf;
+    /// @notice Share of the treasury's part of each seller fee on a vouched line that goes to the voucher.
+    uint16 public voucherFeeBps = 5_000;
+    mapping(address voucher => uint256) public voucherFees;
+    uint256 public voucherFeesTotal;
+
     // ---------------------------------------------------------------- events
 
     event LineOpened(uint256 indexed lineId, address indexed owner, address indexed agent);
@@ -153,6 +180,12 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
     event FeeDistributed(uint256 toPool, uint256 toTreasury);
     event FeesSwept(address indexed treasury, uint256 amount);
     event Liquidated(uint256 indexed lineId, uint256 seized, uint256 loss);
+    event DelegateSet(uint256 indexed lineId, address indexed worker, uint128 cap, uint64 validUntil);
+    event DelegatePaid(uint256 indexed lineId, address indexed worker, uint256 amount);
+    event SweepSet(address indexed earner, uint256 indexed lineId, uint16 bps);
+    event AutoRepaid(uint256 indexed lineId, address indexed earner, uint256 amount);
+    event ManagerSet(uint256 indexed lineId, address indexed manager);
+    event VoucherFee(address indexed voucher, uint256 indexed lineId, uint256 amount);
     event ParamsSet(
         uint16 maxLtvBps, uint16 sellerFeeBps, uint32 billingPeriod, uint32 paymentWindow, uint32 gracePeriod
     );
@@ -194,6 +227,9 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
     error NotSponsored();
     error SponsoredLine();
     error AmountTooSmall();
+    error DelegateInactive();
+    error AboveDelegateCap();
+    error NotManager();
     error EscrowMismatch();
 
     // ---------------------------------------------------------------- setup
@@ -216,6 +252,14 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         address o = _lines[lineId].owner;
         if (o == address(0)) revert UnknownLine();
         if (o != msg.sender) revert NotLineOwner();
+        _;
+    }
+
+    /// @dev The line's owner, or the manager it handed day-to-day control to (vouched lines).
+    modifier onlyLineController(uint256 lineId) {
+        address o = _lines[lineId].owner;
+        if (o == address(0)) revert UnknownLine();
+        if (o != msg.sender && managerOf[lineId] != msg.sender) revert NotLineOwner();
         _;
     }
 
@@ -242,7 +286,7 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
     }
 
     /// @notice Rotate the agent key. Invalidates all intents signed before.
-    function setAgent(uint256 lineId, address agent) external onlyLineOwner(lineId) {
+    function setAgent(uint256 lineId, address agent) external onlyLineController(lineId) {
         if (agent == address(0)) revert ZeroAddress();
         Line storage l = _lines[lineId];
         l.agent = agent;
@@ -285,7 +329,7 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
     /// @notice Replace the mandate. Resets the budget counter and invalidates older signed intents.
     function setMandate(uint256 lineId, uint128 maxPerPayment, uint128 budget, uint64 validUntil, bytes32 sellersRoot)
         external
-        onlyLineOwner(lineId)
+        onlyLineController(lineId)
     {
         uint32 e = _newEpoch(lineId);
         ++mandateVersion[lineId];
@@ -293,7 +337,7 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         emit MandateSet(lineId, e, maxPerPayment, budget, validUntil, sellersRoot);
     }
 
-    function revokeMandate(uint256 lineId) external onlyLineOwner(lineId) {
+    function revokeMandate(uint256 lineId) external onlyLineController(lineId) {
         uint32 e = _newEpoch(lineId);
         ++mandateVersion[lineId];
         delete mandates[lineId];
@@ -301,9 +345,74 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
     }
 
     /// @notice Cancel a single signed intent before anyone submits it.
-    function cancelNonce(uint256 lineId, uint256 nonce) external onlyLineOwner(lineId) {
+    function cancelNonce(uint256 lineId, uint256 nonce) external onlyLineController(lineId) {
         nonceUsed[lineId][nonce] = true;
         emit NonceCancelled(lineId, nonce);
+    }
+
+    // ---------------------------------------------------------------- sub-tabs
+
+    /// @notice Let `worker` sign payments on this line, up to `cap` in total, until `validUntil`. The line's agent
+    ///         (an orchestrator) or its controller may call this. Setting again resets the worker's spend.
+    function setDelegate(uint256 lineId, address worker, uint128 cap, uint64 validUntil) external {
+        Line storage l = _lines[lineId];
+        if (l.owner == address(0)) revert UnknownLine();
+        if (msg.sender != l.agent && msg.sender != l.owner && msg.sender != managerOf[lineId]) revert NotLineOwner();
+        if (worker == address(0) || worker == l.agent) revert ZeroAddress();
+        delegates[lineId][worker] = Delegate(cap, 0, validUntil, l.epoch);
+        emit DelegateSet(lineId, worker, cap, validUntil);
+    }
+
+    // ---------------------------------------------------------------- self-funding
+
+    /// @notice Repay this line from `bps` of what `earner` (the line's agent or owner) is paid through Tally.
+    ///         bps 0 turns it off.
+    function setSweep(uint256 lineId, address earner, uint16 bps) external onlyLineController(lineId) {
+        Line storage l = _lines[lineId];
+        if ((earner != l.agent && earner != l.owner) || bps > BPS) revert BadParams();
+        sweepLine[earner] = lineId;
+        sweepBps[earner] = bps;
+        emit SweepSet(earner, lineId, bps);
+    }
+
+    /// @dev Repay the earner's own line from its payout. Returns the amount taken (sent to the pool).
+    function _sweep(address earner, uint256 payout, uint256 payingLine) internal returns (uint256 amount) {
+        uint256 lineId = sweepLine[earner];
+        uint16 bps = sweepBps[earner];
+        if (bps == 0 || lineId == payingLine) return 0;
+        Line storage l = _lines[lineId];
+        if (earner != l.agent && earner != l.owner) return 0; // stale: the line changed hands or keys
+        amount = _applyRepay(lineId, l, (payout * bps) / BPS);
+        if (amount > 0) emit AutoRepaid(lineId, earner, amount);
+    }
+
+    // ---------------------------------------------------------------- vouching
+
+    /// @notice Hand day-to-day control of a vouched (sponsored) line to `manager`, who must accept. The owner
+    ///         (the voucher) keeps the stake, the cap and this power. address(0) removes the manager.
+    function setManager(uint256 lineId, address manager) external onlyLineOwner(lineId) {
+        if (sponsorOf[lineId] == 0) revert NotSponsored();
+        pendingManagerOf[lineId] = manager;
+        if (manager == address(0)) {
+            managerOf[lineId] = address(0);
+            emit ManagerSet(lineId, address(0));
+        }
+    }
+
+    function acceptManager(uint256 lineId) external {
+        if (msg.sender == address(0) || pendingManagerOf[lineId] != msg.sender) revert NotManager();
+        managerOf[lineId] = msg.sender;
+        delete pendingManagerOf[lineId];
+        emit ManagerSet(lineId, msg.sender);
+    }
+
+    function claimVoucherFees(address to) external nonReentrant returns (uint256 amount) {
+        amount = voucherFees[msg.sender];
+        if (amount == 0) revert ZeroAmount();
+        if (to == address(0)) revert ZeroAddress();
+        voucherFees[msg.sender] = 0;
+        voucherFeesTotal -= amount;
+        usdc.safeTransfer(to, amount);
     }
 
     // ---------------------------------------------------------------- sponsors (Tally for Networks)
@@ -393,7 +502,10 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         if (block.timestamp > p.deadline) revert IntentExpired();
         if (p.epoch != l.epoch) revert StaleEpoch();
         if (nonceUsed[p.lineId][p.nonce]) revert NonceUsed();
-        if (!SignatureChecker.isValidSignatureNow(l.agent, hashIntent(p), signature)) revert BadSignature();
+        bytes32 digest = hashIntent(p);
+        if (!SignatureChecker.isValidSignatureNow(l.agent, digest, signature)) {
+            _spendAsDelegate(p, l, digest, signature);
+        }
 
         _checkMandate(p.lineId, p.seller, p.amount, proof);
         _roll(l);
@@ -416,11 +528,29 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         } else {
             _bill(p.lineId, l, p.amount);
             pool.fund(address(this), p.amount);
-            usdc.safeTransfer(p.seller, p.amount - fee);
-            _distributeFee(fee);
+            uint256 swept = _sweep(p.seller, p.amount - fee, p.lineId);
+            usdc.safeTransfer(p.seller, p.amount - fee - swept);
+            if (swept > 0) {
+                usdc.safeTransfer(address(pool), swept);
+                pool.recordRepayment(swept);
+            }
+            _distributeFee(p.lineId, fee);
         }
 
         emit Paid(p.lineId, p.seller, p.amount, fee, p.resource, p.nonce, holdId);
+    }
+
+    /// @dev The intent was not signed by the line's agent: accept it only from an active worker within its cap.
+    function _spendAsDelegate(PaymentIntent calldata p, Line storage l, bytes32 digest, bytes calldata signature)
+        internal
+    {
+        (address worker, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
+        Delegate storage d = delegates[p.lineId][worker];
+        if (err != ECDSA.RecoverError.NoError || d.validUntil == 0) revert BadSignature();
+        if (d.epoch != l.epoch || d.validUntil < block.timestamp) revert DelegateInactive();
+        if (uint256(d.spent) + p.amount > d.cap) revert AboveDelegateCap();
+        d.spent += SafeCast.toUint128(p.amount);
+        emit DelegatePaid(p.lineId, worker, p.amount);
     }
 
     function _checkSeller(address seller) internal view {
@@ -505,14 +635,23 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         Line storage l = _lines[lineId];
         l.held -= SafeCast.toUint128(amount);
         _bill(lineId, l, amount);
-        _distributeFee(fee);
+        _distributeFee(lineId, fee);
     }
 
     /// @dev Pool share goes to the pool at once and unlocks into share value over a day; the rest waits for sweepFees.
-    function _distributeFee(uint256 fee) internal {
+    function _distributeFee(uint256 lineId, uint256 fee) internal {
         if (fee == 0) return;
         uint256 toPool = (fee * poolFeeShareBps) / BPS;
         uint256 toTreasury = fee - toPool;
+        if (managerOf[lineId] != address(0)) {
+            // A vouched line: the voucher earns part of the treasury's share for taking the risk.
+            address voucher = _sponsors[sponsorOf[lineId]].owner;
+            uint256 cut = (toTreasury * voucherFeeBps) / BPS;
+            voucherFees[voucher] += cut;
+            voucherFeesTotal += cut;
+            toTreasury -= cut;
+            emit VoucherFee(voucher, lineId, cut);
+        }
         if (toPool > 0) {
             usdc.safeTransfer(address(pool), toPool);
             pool.addYield(toPool); // unlocks over time, so a same-block deposit can't skim it
@@ -554,19 +693,23 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
     function repay(uint256 lineId, uint256 amount) external nonReentrant returns (uint256 paid) {
         Line storage l = _lines[lineId];
         if (l.owner == address(0)) revert UnknownLine();
+        paid = _applyRepay(lineId, l, amount);
+        if (paid == 0) revert ZeroAmount();
+        usdc.safeTransferFrom(msg.sender, address(pool), paid);
+        pool.recordRepayment(paid);
+        emit Repaid(lineId, msg.sender, paid);
+    }
+
+    /// @dev Reduce the billable balance by up to `amount` (statement first). The caller moves the USDC.
+    function _applyRepay(uint256 lineId, Line storage l, uint256 amount) internal returns (uint256 paid) {
         _roll(l);
         paid = Math.min(amount, uint256(l.billed) + l.unbilled);
-        if (paid == 0) revert ZeroAmount();
-
+        if (paid == 0) return 0;
         uint256 fromBilled = Math.min(paid, l.billed);
         l.billed -= SafeCast.toUint128(fromBilled);
         l.unbilled -= SafeCast.toUint128(paid - fromBilled);
         if (l.billed == 0) (l.statementDue, l.liquidatableAt) = (0, 0);
         _sponsorSub(lineId, paid);
-
-        usdc.safeTransferFrom(msg.sender, address(pool), paid);
-        pool.recordRepayment(paid);
-        emit Repaid(lineId, msg.sender, paid);
     }
 
     // ---------------------------------------------------------------- default
@@ -644,49 +787,8 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         return _outstanding(_lines[lineId]);
     }
 
-    /// @notice The line's statement as it stands now, including a cycle that has closed but not rolled.
-    function statementOf(uint256 lineId)
-        public
-        view
-        returns (uint256 billed, uint256 unbilled, uint256 held, uint256 dueAt, uint256 cycleEnd)
-    {
-        Line storage l = _lines[lineId];
-        billed = l.billed;
-        unbilled = l.unbilled;
-        held = l.held;
-        dueAt = l.statementDue;
-        cycleEnd = l.cycleEnd;
-        if (cycleEnd != 0 && block.timestamp >= cycleEnd) {
-            if (unbilled > 0) {
-                billed += unbilled;
-                unbilled = 0;
-                if (dueAt == 0) dueAt = cycleEnd + l.cycleWindow;
-            }
-            cycleEnd = 0;
-        }
-    }
-
-    function isPastDue(uint256 lineId) external view returns (bool) {
-        Line storage l = _lines[lineId];
-        (uint256 billed,,, uint256 dueAt,) = statementOf(lineId);
-        uint256 at = l.statementDue != 0 ? l.liquidatableAt : dueAt + l.cycleGrace;
-        return billed > 0 && block.timestamp > at;
-    }
-
-    /// @notice Most the line could owe right now: own collateral times LTV, or for a sponsored line the
-    ///         sponsor's limit (shared with its other lines) capped by the line's own cap.
-    function creditLimit(uint256 lineId) public view returns (uint256) {
-        uint256 sid = sponsorOf[lineId];
-        if (sid == 0) return (uint256(_lines[lineId].collateral) * maxLtvBps) / BPS;
-        uint256 limit = (uint256(_sponsors[sid].collateral) * maxLtvBps) / BPS;
-        uint256 cap = lineCap[lineId];
-        return cap < limit ? cap : limit;
-    }
-
-    /// @notice What the line can spend now. For sponsored lines this accounts for the sponsor's other lines.
-    function availableCredit(uint256 lineId) external view returns (uint256) {
-        return _available(lineId, _lines[lineId]);
-    }
+    // statementOf, isPastDue, creditLimit and availableCredit live in TabLens (read-only), to keep this
+    // contract under the code-size limit.
 
     function getSponsor(uint256 sponsorId) external view returns (Sponsor memory) {
         return _sponsors[sponsorId];
@@ -729,6 +831,11 @@ contract TabManager is EIP712, AccessControl, ReentrancyGuard, Pausable {
         paymentWindow = paymentWindow_;
         gracePeriod = gracePeriod_;
         emit ParamsSet(maxLtvBps_, sellerFeeBps_, billingPeriod_, paymentWindow_, gracePeriod_);
+    }
+
+    function setVoucherFeeShare(uint16 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (bps > BPS) revert BadParams();
+        voucherFeeBps = bps;
     }
 
     function setPoolFeeShare(uint16 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {

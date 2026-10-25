@@ -98,7 +98,7 @@ contract Handler is Test {
             resource: bytes32(nonce),
             escrowed: escrowed,
             nonce: ++nonce,
-            deadline: block.timestamp + 1 hours
+            deadline: vm.getBlockTimestamp() + 1 hours
         });
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(agentPkOf[id], tabs.hashIntent(p));
         try tabs.pay(p, abi.encodePacked(r, s, v), new bytes32[](0)) returns (uint256 holdId) {
@@ -132,7 +132,7 @@ contract Handler is Test {
     }
 
     function warp(uint256 secs) external {
-        vm.warp(block.timestamp + bound(secs, 10 minutes, 3 days));
+        vm.warp(vm.getBlockTimestamp() + bound(secs, 10 minutes, 3 days));
     }
 
     function liquidate(uint256 lineSeed) external {
@@ -236,7 +236,7 @@ contract InvariantsTest is Test {
             sum += tabs.getLine(handler.lineIds(i)).collateral;
         }
         sum += tabs.getSponsor(handler.sponsorId()).collateral;
-        assertEq(usdc.balanceOf(address(tabs)), sum + tabs.feesAccrued());
+        assertEq(usdc.balanceOf(address(tabs)), sum + tabs.feesAccrued() + tabs.voucherFeesTotal());
     }
 
     /// Escrow holds exactly the open (held or flagged) amounts.

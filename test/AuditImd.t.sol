@@ -19,12 +19,14 @@ contract AuditImdTest is BaseTest {
         for (uint32 i = 0; i < 3; i++) {
             guesses[i] = _intent(50 * USDC, 100 + i, false);
             guesses[i].epoch = e0 + i + 1;
-            guesses[i].deadline = block.timestamp + 365 days;
+            guesses[i].deadline = vm.getBlockTimestamp() + 365 days;
         }
         vm.startPrank(owner);
         tabs.revokeMandate(lineId);
         vm.prevrandao(bytes32(uint256(42)));
-        tabs.setMandate(lineId, uint128(100 * USDC), uint128(500 * USDC), uint64(block.timestamp + 30 days), bytes32(0));
+        tabs.setMandate(
+            lineId, uint128(100 * USDC), uint128(500 * USDC), uint64(vm.getBlockTimestamp() + 30 days), bytes32(0)
+        );
         vm.stopPrank();
         for (uint256 i = 0; i < 3; i++) {
             _payExpectRevert(guesses[i], abi.encodeWithSelector(TabManager.StaleEpoch.selector));
@@ -52,7 +54,7 @@ contract AuditImdTest is BaseTest {
 
     /// A statement keeps the grace in force when its cycle opened, whatever setParams does later.
     function test_F4_IssuedStatementKeepsItsGrace() public {
-        uint256 t0 = block.timestamp;
+        uint256 t0 = vm.getBlockTimestamp();
         _pay(_intent(100 * USDC, 1, false));
         vm.warp(t0 + 10 days + 1); // due at t0+10d, grace to t0+12d
         vm.expectRevert(TabManager.NotPastDue.selector);
@@ -62,23 +64,23 @@ contract AuditImdTest is BaseTest {
         tabs.setParams(10_000, 100, 7 days, 3 days, 0);
         vm.expectRevert(TabManager.NotPastDue.selector);
         tabs.liquidate(lineId);
-        assertFalse(tabs.isPastDue(lineId));
+        assertFalse(lens.isPastDue(lineId));
         assertEq(_collateral(lineId), 1_000 * USDC);
 
         vm.warp(t0 + 12 days + 1);
-        assertTrue(tabs.isPastDue(lineId));
+        assertTrue(lens.isPastDue(lineId));
         (uint256 seized,) = tabs.liquidate(lineId);
         assertEq(seized, 100 * USDC);
     }
 
     /// The terms are fixed when the cycle opens, even if the cycle closes before anyone rolls it.
     function test_F4_ParamsChangedAfterCycleCloseDontRetime() public {
-        uint256 t0 = block.timestamp;
+        uint256 t0 = vm.getBlockTimestamp();
         _pay(_intent(100 * USDC, 1, false));
         vm.warp(t0 + 7 days + 1); // cycle closed, not rolled yet
         vm.prank(admin);
         tabs.setParams(10_000, 100, 7 days, 1 days, 0);
-        (,,, uint256 dueAt,) = tabs.statementOf(lineId);
+        (,,, uint256 dueAt,) = lens.statementOf(lineId);
         assertEq(dueAt, t0 + 10 days, "payment window from when the cycle opened");
         vm.warp(t0 + 11 days);
         vm.expectRevert(TabManager.NotPastDue.selector);
@@ -104,7 +106,7 @@ contract AuditImdTest is BaseTest {
 
         // Long-term lenders get the fee once it unlocks.
         uint256 before = pool.convertToAssets(pool.balanceOf(lp));
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         assertApproxEqAbs(
             pool.convertToAssets(pool.balanceOf(lp)), before + 0.5e6, 1, "the LP gets the whole lender fee"
         );
@@ -113,9 +115,9 @@ contract AuditImdTest is BaseTest {
     function test_F5_YieldUnlocksLinearly() public {
         _pay(_intent(100 * USDC, 1, false));
         assertEq(pool.unvestedYield(), 0.5e6);
-        vm.warp(block.timestamp + 12 hours);
+        vm.warp(vm.getBlockTimestamp() + 12 hours);
         assertEq(pool.unvestedYield(), 0.25e6);
-        vm.warp(block.timestamp + 12 hours);
+        vm.warp(vm.getBlockTimestamp() + 12 hours);
         assertEq(pool.unvestedYield(), 0);
     }
 

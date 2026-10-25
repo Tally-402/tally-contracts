@@ -21,10 +21,10 @@ contract TabManagerTest is BaseTest {
         assertEq(pool.outstanding(), 40 * USDC);
         assertEq(pool.totalAssets(), assetsBefore, "fee income is locked at first");
         assertEq(pool.unvestedYield(), 0.2e6, "lenders' half of the fee is locked");
-        assertEq(_cycleEnd(lineId), block.timestamp + 7 days, "opens a weekly cycle");
+        assertEq(_cycleEnd(lineId), vm.getBlockTimestamp() + 7 days, "opens a weekly cycle");
         assertEq(_dueAt(lineId), 0, "nothing is due until the cycle closes");
-        assertEq(tabs.availableCredit(lineId), 960 * USDC);
-        vm.warp(block.timestamp + 1 days);
+        assertEq(lens.availableCredit(lineId), 960 * USDC);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         assertEq(pool.totalAssets(), assetsBefore + 0.2e6, "lenders earn half the fee once it unlocks");
     }
 
@@ -79,11 +79,13 @@ contract TabManagerTest is BaseTest {
     }
 
     function test_RevertWhen_MandateExpiredOrRevoked() public {
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
         _payExpectRevert(_intent(1 * USDC, 1, false), abi.encodeWithSelector(TabManager.MandateInactive.selector));
 
         vm.startPrank(owner);
-        tabs.setMandate(lineId, uint128(100 * USDC), uint128(500 * USDC), uint64(block.timestamp + 1 days), bytes32(0));
+        tabs.setMandate(
+            lineId, uint128(100 * USDC), uint128(500 * USDC), uint64(vm.getBlockTimestamp() + 1 days), bytes32(0)
+        );
         tabs.revokeMandate(lineId);
         vm.stopPrank();
         _payExpectRevert(_intent(1 * USDC, 2, false), abi.encodeWithSelector(TabManager.MandateInactive.selector));
@@ -92,7 +94,7 @@ contract TabManagerTest is BaseTest {
     function test_RevertWhen_AboveCreditLimit() public {
         vm.prank(owner);
         tabs.setMandate(
-            lineId, uint128(5_000 * USDC), uint128(5_000 * USDC), uint64(block.timestamp + 1 days), bytes32(0)
+            lineId, uint128(5_000 * USDC), uint128(5_000 * USDC), uint64(vm.getBlockTimestamp() + 1 days), bytes32(0)
         );
         _payExpectRevert(
             _intent(1_001 * USDC, 1, false),
@@ -106,7 +108,7 @@ contract TabManagerTest is BaseTest {
         bytes32 b = keccak256(bytes.concat(keccak256(abi.encode(other))));
         bytes32 root = a < b ? keccak256(abi.encode(a, b)) : keccak256(abi.encode(b, a));
         vm.prank(owner);
-        tabs.setMandate(lineId, uint128(100 * USDC), uint128(500 * USDC), uint64(block.timestamp + 1 days), root);
+        tabs.setMandate(lineId, uint128(100 * USDC), uint128(500 * USDC), uint64(vm.getBlockTimestamp() + 1 days), root);
 
         bytes32[] memory proof = new bytes32[](1);
         proof[0] = b;
@@ -155,9 +157,9 @@ contract TabManagerTest is BaseTest {
 
     function test_PartialRepay_KeepsDueDate() public {
         _pay(_intent(50 * USDC, 1, false));
-        vm.warp(block.timestamp + 7 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
         uint256 due = _dueAt(lineId);
-        assertEq(due, block.timestamp + 3 days);
+        assertEq(due, vm.getBlockTimestamp() + 3 days);
         vm.prank(owner);
         tabs.repay(lineId, 20 * USDC);
         assertEq(_outstanding(lineId), 30 * USDC);
@@ -198,7 +200,7 @@ contract TabManagerTest is BaseTest {
 
     function test_PastDue_BlocksNewPayments() public {
         _pay(_intent(10 * USDC, 1, false));
-        vm.warp(block.timestamp + 7 days + 3 days + 1);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 3 days + 1);
         _payExpectRevert(_intent(10 * USDC, 2, false), abi.encodeWithSelector(TabManager.PastDue.selector));
     }
 
@@ -206,11 +208,11 @@ contract TabManagerTest is BaseTest {
         _pay(_intent(100 * USDC, 1, false));
         uint256 assetsBefore = pool.totalAssets() + pool.unvestedYield(); // the fee has unlocked by liquidation
 
-        vm.warp(block.timestamp + 7 days + 3 days + 2 days);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 3 days + 2 days);
         vm.expectRevert(TabManager.NotPastDue.selector);
         tabs.liquidate(lineId);
 
-        vm.warp(block.timestamp + 1);
+        vm.warp(vm.getBlockTimestamp() + 1);
         (uint256 seized, uint256 loss) = tabs.liquidate(lineId);
         assertEq(seized, 100 * USDC);
         assertEq(loss, 0);
@@ -254,27 +256,27 @@ contract TabManagerTest is BaseTest {
     /// M-2: a draw late in a cycle still gets the full payment window.
     function test_LateDraw_GetsFullPaymentWindow() public {
         _pay(_intent(10 * USDC, 1, false));
-        vm.warp(block.timestamp + 7 days - 1); // last second of the cycle
+        vm.warp(vm.getBlockTimestamp() + 7 days - 1); // last second of the cycle
         _pay(_intent(100 * USDC, 2, false));
-        vm.warp(block.timestamp + 1); // cycle closes
-        assertEq(_dueAt(lineId), block.timestamp + 3 days);
-        vm.warp(block.timestamp + 3 days + 2 days);
-        assertFalse(tabs.isPastDue(lineId), "not liquidatable inside window + grace");
-        vm.warp(block.timestamp + 1);
-        assertTrue(tabs.isPastDue(lineId));
+        vm.warp(vm.getBlockTimestamp() + 1); // cycle closes
+        assertEq(_dueAt(lineId), vm.getBlockTimestamp() + 3 days);
+        vm.warp(vm.getBlockTimestamp() + 3 days + 2 days);
+        assertFalse(lens.isPastDue(lineId), "not liquidatable inside window + grace");
+        vm.warp(vm.getBlockTimestamp() + 1);
+        assertTrue(lens.isPastDue(lineId));
     }
 
     /// Spending after a cycle closes starts a new cycle with its own due date.
     function test_NewCycle_AfterClose() public {
         _pay(_intent(10 * USDC, 1, false));
-        vm.warp(block.timestamp + 7 days + 1);
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
         _pay(_intent(20 * USDC, 2, false));
-        (uint256 billed, uint256 unbilled,,,) = tabs.statementOf(lineId);
+        (uint256 billed, uint256 unbilled,,,) = lens.statementOf(lineId);
         assertEq(billed, 10 * USDC);
         assertEq(unbilled, 20 * USDC);
         vm.prank(owner);
         tabs.repay(lineId, 10 * USDC); // pays the statement first
-        (billed, unbilled,,,) = tabs.statementOf(lineId);
+        (billed, unbilled,,,) = lens.statementOf(lineId);
         assertEq(billed, 0);
         assertEq(unbilled, 20 * USDC);
         assertEq(_dueAt(lineId), 0);
@@ -286,7 +288,9 @@ contract TabManagerTest is BaseTest {
         bytes memory sig = _sign(p, agentPk);
         vm.startPrank(owner);
         tabs.revokeMandate(lineId);
-        tabs.setMandate(lineId, uint128(100 * USDC), uint128(500 * USDC), uint64(block.timestamp + 1 days), bytes32(0));
+        tabs.setMandate(
+            lineId, uint128(100 * USDC), uint128(500 * USDC), uint64(vm.getBlockTimestamp() + 1 days), bytes32(0)
+        );
         vm.stopPrank();
         vm.expectRevert(TabManager.StaleEpoch.selector);
         tabs.pay(p, sig, new bytes32[](0));
@@ -361,11 +365,11 @@ contract CreditPoolTest is BaseTest {
     function test_WithdrawLimitedToIdle() public {
         vm.prank(owner);
         tabs.setMandate(
-            lineId, uint128(1_000 * USDC), uint128(1_000 * USDC), uint64(block.timestamp + 1 days), bytes32(0)
+            lineId, uint128(1_000 * USDC), uint128(1_000 * USDC), uint64(vm.getBlockTimestamp() + 1 days), bytes32(0)
         );
         _pay(_intent(1_000 * USDC, 1, false));
         assertEq(pool.totalAssets(), 1_000_000 * USDC, "fee still locked");
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         assertEq(pool.maxWithdraw(lp), 999_005 * USDC);
         assertEq(pool.totalAssets(), 1_000_005 * USDC);
     }
@@ -410,7 +414,7 @@ contract CreditPoolTest is BaseTest {
         usdc.approve(address(tabs), type(uint256).max);
         uint256 id = tabs.openLine(vm.addr(pk));
         tabs.depositCollateral(id, 2_000_000 * USDC);
-        tabs.setMandate(id, type(uint128).max, type(uint128).max, uint64(block.timestamp + 1 days), bytes32(0));
+        tabs.setMandate(id, type(uint128).max, type(uint128).max, uint64(vm.getBlockTimestamp() + 1 days), bytes32(0));
         vm.stopPrank();
 
         TabManager.PaymentIntent memory p = TabManager.PaymentIntent({
@@ -421,7 +425,7 @@ contract CreditPoolTest is BaseTest {
             resource: bytes32(0),
             escrowed: false,
             nonce: 1,
-            deadline: block.timestamp + 1 hours
+            deadline: vm.getBlockTimestamp() + 1 hours
         });
         bytes memory sig = _sign(p, pk);
         vm.expectRevert(abi.encodeWithSelector(CreditPool.UtilizationCap.selector, 950_000 * USDC, 900_000 * USDC));
@@ -466,7 +470,7 @@ contract CreditPoolTest is BaseTest {
         }
         vm.prank(owner);
         tabs.repay(lineId, 500 * USDC);
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         assertGt(pool.convertToAssets(1e12), before);
         assertEq(pool.totalAssets(), 1_000_000 * USDC + 2.5e6, "half of 5 USDC in fees");
     }

@@ -22,7 +22,7 @@ contract SponsoredTest is BaseTest {
         tabs.depositSponsorCollateral(sponsorId, 300 * USDC);
         lineA = tabs.openSponsoredLine(sponsorId, vm.addr(pkA), tabs.NO_CAP());
         lineB = tabs.openSponsoredLine(sponsorId, vm.addr(pkB), uint128(50 * USDC));
-        uint64 until = uint64(block.timestamp + 30 days);
+        uint64 until = uint64(vm.getBlockTimestamp() + 30 days);
         tabs.setMandate(lineA, uint128(1_000 * USDC), uint128(1_000 * USDC), until, bytes32(0));
         tabs.setMandate(lineB, uint128(1_000 * USDC), uint128(1_000 * USDC), until, bytes32(0));
         vm.stopPrank();
@@ -50,8 +50,8 @@ contract SponsoredTest is BaseTest {
         _payAs(pkA, _intentFor(lineA, 200 * USDC, 1, false));
         _payAs(pkB, _intentFor(lineB, 40 * USDC, 1, false));
         assertEq(_sponsorOut(), 240 * USDC);
-        assertEq(tabs.availableCredit(lineA), 60 * USDC, "sponsor has 60 left");
-        assertEq(tabs.availableCredit(lineB), 10 * USDC, "line B's cap leaves 10");
+        assertEq(lens.availableCredit(lineA), 60 * USDC, "sponsor has 60 left");
+        assertEq(lens.availableCredit(lineB), 10 * USDC, "line B's cap leaves 10");
         assertEq(pool.outstanding(), 240 * USDC);
     }
 
@@ -78,7 +78,7 @@ contract SponsoredTest is BaseTest {
     function test_ZeroCapFreezesLine() public {
         vm.prank(network);
         tabs.setLineCap(lineA, 0);
-        assertEq(tabs.availableCredit(lineA), 0);
+        assertEq(lens.availableCredit(lineA), 0);
         TabManager.PaymentIntent memory p = _intentFor(lineA, 1, 1, false);
         bytes memory sig = _sign(p, pkA);
         vm.expectRevert(abi.encodeWithSelector(TabManager.AboveCreditLimit.selector, 1, 0));
@@ -103,7 +103,7 @@ contract SponsoredTest is BaseTest {
     function test_PastDueLineLiquidatesAgainstSponsor() public {
         _payAs(pkA, _intentFor(lineA, 100 * USDC, 1, false));
         _payAs(pkB, _intentFor(lineB, 20 * USDC, 1, false));
-        vm.warp(block.timestamp + 12 days + 1);
+        vm.warp(vm.getBlockTimestamp() + 12 days + 1);
         (uint256 seized, uint256 loss) = tabs.liquidate(lineA);
         assertEq(seized, 100 * USDC);
         assertEq(loss, 0);
@@ -143,7 +143,7 @@ contract SponsoredTest is BaseTest {
         vm.expectRevert(TabManager.NotSponsorOwner.selector);
         tabs.withdrawSponsorCollateral(sponsorId, 1, owner);
         vm.expectRevert(TabManager.NotLineOwner.selector);
-        tabs.setMandate(lineA, 1, 1, uint64(block.timestamp + 1 days), bytes32(0));
+        tabs.setMandate(lineA, 1, 1, uint64(vm.getBlockTimestamp() + 1 days), bytes32(0));
         vm.expectRevert(TabManager.NotSponsored.selector);
         tabs.setLineCap(lineId, 1);
         vm.stopPrank();
@@ -153,7 +153,7 @@ contract SponsoredTest is BaseTest {
         _payAs(pkA, _intentFor(lineA, 300 * USDC, 1, false));
         _pay(_intent(100 * USDC, 1, false)); // the base line still uses its own 1,000 collateral
         assertEq(_outstanding(lineId), 100 * USDC);
-        assertEq(tabs.availableCredit(lineId), 900 * USDC);
+        assertEq(lens.availableCredit(lineId), 900 * USDC);
     }
 
     function testFuzz_SponsorNeverOverLent(uint96 a, uint96 b) public {
